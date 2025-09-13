@@ -1,63 +1,95 @@
 import express from "express";
 import multer from "multer";
 import fs from "fs";
-import fetch from "node-fetch";
-import OpenAI from "openai";
+import path from "path";
+import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+
+dotenv.config();
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+app.use(cors());
 app.use(express.json());
+app.use("/public", express.static("public"));
 
-// 🎙️ 1. Handle voice queries
-app.post("/api/voice/query", upload.single("file"), async (req, res) => {
+const whisperClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+app.post("/api/voice/query", upload.single("audio"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No audio file uploaded" });
+  }
+
+  const tempFilePath = req.file.path;
+
   try {
-    // 1️⃣ Speech-to-Text (Whisper)
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(req.file.path),
+    console.log("🎧 Transcribing with Whisper...");
+    const transcription = await whisperClient.audio.transcriptions.create({
+      file: fs.createReadStream(tempFilePath),
       model: "whisper-1",
+      response_format: "text",
+      language: req.body.language || "en",
     });
 
-    const userText = transcription.text;
+    const userText = transcription;
+    console.log("👤 Transcribed:", userText);
 
-    // 2️⃣ Process with GPT (business logic)
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+    const payload = {
+      model: "openai/gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a helpful assistant for drivers." },
-        { role: "user", content: userText },
+        {
+          role: "system",
+          content: "You are a helpful assistant for Porter drivers. Answer simply in Hinglish.",
+        },
+        {
+          role: "user",
+          content: userText,
+        },
       ],
+    };
+
+    console.log("🤖 Sending to OpenRouter...");
+
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
     });
 
-    const responseText = completion.choices[0].message.content;
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("❌ GPT Error:", error);
+      return res.status(500).json({ error: "GPT processing failed", details: error });
+    }
 
-    // 3️⃣ Text-to-Speech (TTS)
-    const ttsFile = `tts-${uuidv4()}.mp3`;
-    const speech = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice: "alloy",
-      input: responseText,
-    });
+    const data = await response.json();
+    const responseText = data.choices?.[0]?.message?.content || "No response";
 
-    const buffer = Buffer.from(await speech.arrayBuffer());
-    fs.writeFileSync(`public/${ttsFile}`, buffer);
+    console.log("✅ Assistant:", responseText);
 
-    // 4️⃣ Send response back
     res.json({
       speechText: responseText,
-      visual: responseText,
-      audioUrl: `/public/${ttsFile}`,
-      followupAction: null,
+      visual: "📊 Sample visualization",
+      ttsAudioUrl: null,
     });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error:", err.toString());
     res.status(500).json({ error: "Processing failed" });
+  } finally {
+    if (fs.existsSync(tempFilePath)) {
+      fs.promises.unlink(tempFilePath).catch(() => {});
+    }
   }
 });
 
-// Static files for audio playback
-app.use("/public", express.static("public"));
-
-app.listen(3000, () => console.log("✅ Backend running on http://localhost:3000"));
+app.listen(3000, () => {
+  console.log("✅ Backend running at http://localhost:3000");
+});
